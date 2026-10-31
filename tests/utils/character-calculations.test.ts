@@ -6,8 +6,10 @@ import {
   computeLevel,
   calculateMaxHp,
   calculateCurrentHp,
+  collectSpells,
+  isCastableSpell,
 } from "../../src/utils/character-calculations.js";
-import type { DdbCharacter, DdbModifier } from "../../src/types/character.js";
+import type { DdbCharacter, DdbModifier, DdbSpell } from "../../src/types/character.js";
 
 describe("computeFinalAbilityScore", () => {
   const baseStats = [
@@ -365,6 +367,194 @@ describe("calculateAc", () => {
     const result = calculateAc(charWithAcBonus);
     expect(result).toBe(13); // 10 + 2 (DEX) + 1 (feature)
   });
+
+  it("should apply natural armor stored as a 'set' modifier (Lizardfolk)", () => {
+    // Real Lizardfolk modifier: { type: "set", subType: "unarmored-armor-class", value: 3 }
+    const lizardfolk = {
+      ...baseChar,
+      modifiers: {
+        race: [
+          { type: "set", subType: "unarmored-armor-class", value: 3 } as DdbModifier,
+        ],
+        class: [],
+        background: [],
+        item: [],
+        feat: [],
+        condition: [],
+      },
+    } as unknown as DdbCharacter;
+
+    const result = calculateAc(lizardfolk);
+    expect(result).toBe(15); // 13 natural + 2 DEX
+  });
+
+  it("should detect a shield whose definition.type is empty", () => {
+    // Real DDB payload: { name: "Shield", type: "", filterType: "Armor", armorClass: 2 }
+    const charWithRealShield = {
+      ...baseChar,
+      inventory: [
+        {
+          id: 1,
+          definition: {
+            name: "Shield",
+            type: "",
+            filterType: "Armor",
+            armorClass: 2,
+            rarity: "Common",
+            weight: 6,
+            cost: null,
+            isHomebrew: false,
+            description: "",
+          },
+          equipped: true,
+          quantity: 1,
+        },
+      ],
+    } as unknown as DdbCharacter;
+
+    const result = calculateAc(charWithRealShield);
+    expect(result).toBe(14); // 10 + 2 (DEX) + 2 (shield)
+  });
+
+  it("should combine natural armor and shield (real Krisk payload => 17)", () => {
+    const krisk = {
+      ...baseChar,
+      modifiers: {
+        race: [
+          { type: "set", subType: "unarmored-armor-class", value: 3 } as DdbModifier,
+        ],
+        class: [],
+        background: [],
+        item: [],
+        feat: [],
+        condition: [],
+      },
+      inventory: [
+        {
+          id: 1,
+          definition: {
+            name: "Shield",
+            type: "",
+            filterType: "Armor",
+            armorClass: 2,
+            rarity: "Common",
+            weight: 6,
+            cost: null,
+            isHomebrew: false,
+            description: "",
+          },
+          equipped: true,
+          quantity: 1,
+        },
+        {
+          id: 2,
+          definition: {
+            name: "Rapier",
+            type: "Rapier",
+            filterType: "Weapon",
+            armorClass: null,
+            rarity: "Common",
+            weight: 2,
+            cost: null,
+            isHomebrew: false,
+            description: "",
+          },
+          equipped: true,
+          quantity: 1,
+        },
+      ],
+    } as unknown as DdbCharacter;
+
+    expect(calculateAc(krisk)).toBe(17);
+  });
+});
+
+describe("collectSpells", () => {
+  const spell = (name: string, level: number, extra: Record<string, unknown> = {}) =>
+    ({
+      id: 1,
+      definition: { name, level, school: "Evocation" },
+      prepared: false,
+      alwaysPrepared: false,
+      ...extra,
+    }) as unknown as DdbSpell;
+
+  it("should merge DDB v5 classSpells with legacy spells.class", () => {
+    // Real shape for character 172682295: classSpells holds the bard list,
+    // spells.class only holds the subclass's always-known grants.
+    const char = {
+      classSpells: [
+        {
+          characterClassId: 1,
+          spells: [
+            spell("Minor Illusion", 0, { countsAsKnownSpell: true }),
+            spell("Cure Wounds", 1, { countsAsKnownSpell: true }),
+            spell("Thunderwave", 1, { countsAsKnownSpell: true }),
+          ],
+        },
+      ],
+      spells: {
+        class: [spell("Charm Person", 1, { alwaysPrepared: true })],
+        race: null,
+        background: null,
+        item: null,
+        feat: null,
+      },
+    } as unknown as DdbCharacter;
+
+    expect(collectSpells(char).map((s) => s.definition.name)).toEqual([
+      "Minor Illusion",
+      "Cure Wounds",
+      "Thunderwave",
+      "Charm Person",
+    ]);
+  });
+
+  it("should de-duplicate spells present in both shapes", () => {
+    const char = {
+      classSpells: [{ characterClassId: 1, spells: [spell("Cure Wounds", 1)] }],
+      spells: {
+        class: [spell("Cure Wounds", 1)],
+        race: null,
+        background: null,
+        item: null,
+        feat: null,
+      },
+    } as unknown as DdbCharacter;
+
+    expect(collectSpells(char)).toHaveLength(1);
+  });
+
+  it("should tolerate a missing classSpells field", () => {
+    const char = {
+      spells: {
+        class: [spell("Charm Person", 1, { alwaysPrepared: true })],
+        race: null,
+        background: null,
+        item: null,
+        feat: null,
+      },
+    } as unknown as DdbCharacter;
+
+    expect(collectSpells(char).map((s) => s.definition.name)).toEqual(["Charm Person"]);
+  });
+});
+
+describe("isCastableSpell", () => {
+  const base = { definition: { name: "X", level: 1 }, prepared: false, alwaysPrepared: false };
+
+  it("should include known spells that are not flagged prepared (bard/sorcerer/warlock)", () => {
+    expect(isCastableSpell({ ...base, countsAsKnownSpell: true } as unknown as DdbSpell)).toBe(true);
+  });
+
+  it("should include prepared and alwaysPrepared spells", () => {
+    expect(isCastableSpell({ ...base, prepared: true } as unknown as DdbSpell)).toBe(true);
+    expect(isCastableSpell({ ...base, alwaysPrepared: true } as unknown as DdbSpell)).toBe(true);
+  });
+
+  it("should exclude spells that are neither prepared nor known", () => {
+    expect(isCastableSpell(base as unknown as DdbSpell)).toBe(false);
+  });
 });
 
 describe("computeLevel", () => {
@@ -402,6 +592,41 @@ describe("calculateMaxHp", () => {
 
     const result = calculateMaxHp(char);
     expect(result).toBe(47);
+  });
+
+  it("should add the Constitution modifier once per level (real Lizardfolk bard payload)", () => {
+    // Character 172682295: base 14 (rolls), bonus 11, CON 14 (+2), level 3.
+    // D&D Beyond displays 31; base + bonus alone is 25.
+    const char = {
+      baseHitPoints: 14,
+      bonusHitPoints: 11,
+      overrideHitPoints: null,
+      removedHitPoints: 0,
+      stats: [
+        { id: 1, value: 8 },
+        { id: 2, value: 14 },
+        { id: 3, value: 14 },
+        { id: 4, value: 8 },
+        { id: 5, value: 13 },
+        { id: 6, value: 17 },
+      ],
+      bonusStats: [],
+      overrideStats: [],
+      modifiers: { race: [], class: [], background: [], item: [], feat: [], condition: [] },
+      classes: [
+        {
+          id: 1,
+          definition: { name: "Bard" },
+          level: 3,
+          isStartingClass: true,
+          subclassDefinition: null,
+          classFeatures: [],
+        },
+      ],
+    } as unknown as DdbCharacter;
+
+    expect(calculateMaxHp(char)).toBe(31);
+    expect(calculateCurrentHp(char)).toBe(31);
   });
 
   it("should return override when present", () => {
