@@ -122,7 +122,7 @@ describe("formatProficiencies in character sheet", () => {
     expect(text).toContain("Simple Weapons");
     expect(text).toContain("Tools:");
     expect(text).toContain("Smith's Tools");
-    expect(text).toContain("Languages:");
+    expect(text).toContain("--- Languages ---");
     expect(text).toContain("Common");
     expect(text).toContain("Dwarvish");
   });

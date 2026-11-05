@@ -262,6 +262,72 @@ const EXCLUDED_PROFICIENCY_SUBTYPES = new Set([
 const ARMOR_SUBTYPES = new Set(["light-armor", "medium-armor", "heavy-armor", "shields"]);
 const WEAPON_GROUPS = new Set(["simple-weapons", "martial-weapons"]);
 
+// D&D Beyond stores alignment as an integer.
+const ALIGNMENT_NAMES: Record<number, string> = {
+  1: "Lawful Good",
+  2: "Neutral Good",
+  3: "Chaotic Good",
+  4: "Lawful Neutral",
+  5: "Neutral",
+  6: "Chaotic Neutral",
+  7: "Lawful Evil",
+  8: "Neutral Evil",
+  9: "Chaotic Evil",
+};
+
+function formatAlignment(char: DdbCharacter): string {
+  return ALIGNMENT_NAMES[char.alignmentId] ?? "Unaligned";
+}
+
+/**
+ * Languages are not a first-class field on the character payload. They come from
+ * three places: proficiency modifiers, builder language choices, and languages
+ * granted by text in the species' "Languages" trait (e.g. Common).
+ */
+function formatLanguages(char: DdbCharacter): string {
+  const languages = new Set<string>();
+
+  // 1. Language proficiencies granted by any source.
+  for (const list of Object.values(char.modifiers)) {
+    if (!Array.isArray(list)) continue;
+    for (const mod of list) {
+      if (mod.type !== "proficiency") continue;
+      if (!LANGUAGE_SUBTYPES.has(mod.subType)) continue;
+      const name = mod.friendlySubtypeName ||
+        mod.subType.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+      languages.add(name);
+    }
+  }
+
+  // 2. Builder selections ("Choose a Language" etc.) resolved against the option catalogue.
+  const labelById = new Map<number, string>();
+  for (const def of char.choices?.choiceDefinitions ?? []) {
+    for (const opt of def.options ?? []) {
+      if (typeof opt?.id === "number" && opt.label) labelById.set(opt.id, opt.label);
+    }
+  }
+
+  for (const scope of ["race", "class", "background", "feat", "item"] as const) {
+    for (const choice of char.choices?.[scope] ?? []) {
+      if (!choice.label || !/language/i.test(choice.label)) continue;
+      const label = choice.optionValue != null ? labelById.get(choice.optionValue) : undefined;
+      if (label) languages.add(label);
+    }
+  }
+
+  // 3. Fixed languages stated in the species trait text (customizable species still grant Common).
+  const langTrait = (char.race?.racialTraits ?? [])
+    .map((rt) => rt.definition ?? rt)
+    .find((def) => /^languages$/i.test(def.name ?? ""));
+  if (langTrait?.description && /\bCommon\b/.test(langTrait.description)) {
+    languages.add("Common");
+  }
+
+  if (languages.size === 0) return StringUtils.EMPTY;
+
+  return `\n--- Languages ---\n${[...languages].sort().join(", ")}`;
+}
+
 // Known language subTypes (lowercase, hyphenated)
 const LANGUAGE_SUBTYPES = new Set([
   "common", "dwarvish", "elvish", "giant", "gnomish", "goblin", "halfling", "orc",
@@ -274,7 +340,6 @@ function formatProficiencies(char: DdbCharacter): string {
   const armor: Set<string> = new Set();
   const weapons: Set<string> = new Set();
   const tools: Set<string> = new Set();
-  const languages: Set<string> = new Set();
 
   for (const list of Object.values(char.modifiers)) {
     if (!Array.isArray(list)) continue;
@@ -289,7 +354,8 @@ function formatProficiencies(char: DdbCharacter): string {
       } else if (WEAPON_GROUPS.has(mod.subType)) {
         weapons.add(displayName);
       } else if (LANGUAGE_SUBTYPES.has(mod.subType)) {
-        languages.add(displayName);
+        // Languages are reported by formatLanguages(), which also picks up builder choices.
+        continue;
       } else if (mod.subType.endsWith("-tools") || mod.subType.includes("tools") ||
                  mod.subType.includes("kit") || mod.subType.includes("supplies") ||
                  mod.subType.includes("instrument") || mod.subType.includes("set")) {
@@ -308,7 +374,6 @@ function formatProficiencies(char: DdbCharacter): string {
   if (armor.size > 0) lines.push(`Armor: ${[...armor].sort().join(", ")}`);
   if (weapons.size > 0) lines.push(`Weapons: ${[...weapons].sort().join(", ")}`);
   if (tools.size > 0) lines.push(`Tools: ${[...tools].sort().join(", ")}`);
-  if (languages.size > 0) lines.push(`Languages: ${[...languages].sort().join(", ")}`);
 
   if (lines.length === 0) return StringUtils.EMPTY;
 
@@ -354,6 +419,39 @@ function formatSpellcasting(char: DdbCharacter): string {
   return dcStrings.join(" | ");
 }
 
+function resetLabel(resetType: number, description?: string | null): string {
+  if (description) return description;
+  switch (resetType) {
+    case 1: return "short rest";
+    case 2: return "long rest";
+    default: return "unknown";
+  }
+}
+
+/**
+ * Resolves an action's maximum uses. DDB leaves `maxUses` at 0 for resources that scale
+ * with an ability modifier (Bardic Inspiration) or proficiency bonus (Hungry Jaws) and
+ * signals which via `statModifierUsesId` / `useProficiencyBonus`.
+ */
+function resolveMaxUses(char: DdbCharacter, action: DdbAction): number | null {
+  const limited = action.limitedUse;
+  if (!limited) return null;
+  if (limited.maxUses > 0) return limited.maxUses;
+
+  if (typeof limited.statModifierUsesId === "number") {
+    const score = computeFinalAbilityScore(
+      char.stats, char.bonusStats, char.overrideStats, char.modifiers, limited.statModifierUsesId,
+    );
+    return Math.max(1, Math.floor((score - 10) / 2));
+  }
+
+  if (limited.useProficiencyBonus) {
+    return calculateProficiencyBonus(computeLevel(char));
+  }
+
+  return null;
+}
+
 function formatLimitedUseResources(char: DdbCharacter): string {
   const resources: string[] = [];
   const actions = char.actions ?? {};
@@ -361,13 +459,15 @@ function formatLimitedUseResources(char: DdbCharacter): string {
   for (const list of Object.values(actions)) {
     if (!Array.isArray(list)) continue;
     for (const action of list) {
-      if (action.limitedUse) {
-        const used = action.limitedUse.numberUsed;
-        const max = action.limitedUse.maxUses;
-        const remaining = max - used;
-        const reset = action.limitedUse.resetTypeDescription || "unknown";
-        resources.push(`  ${action.name}: ${remaining}/${max} (${reset})`);
-      }
+      if (!action.limitedUse) continue;
+
+      const max = resolveMaxUses(char, action);
+      if (max == null || max <= 0) continue;
+
+      const used = Math.min(action.limitedUse.numberUsed ?? 0, max);
+      const remaining = Math.max(0, max - used);
+      const reset = resetLabel(action.limitedUse.resetType, action.limitedUse.resetTypeDescription);
+      resources.push(`  ${action.name}: ${remaining}/${max} (${reset})`);
     }
   }
 
@@ -438,28 +538,61 @@ function formatSpeed(char: DdbCharacter): string {
   return `Speed: ${totalSpeed} ft`;
 }
 
+function maxSpellSlotsForLevel(char: DdbCharacter, level: number): number {
+  let total = 0;
+  for (const cls of char.classes ?? []) {
+    const table = cls.definition?.spellRules?.levelSpellSlots;
+    if (!Array.isArray(table) || table.length === 0) continue;
+    const row = table[Math.min(cls.level, table.length - 1)];
+    if (!Array.isArray(row)) continue;
+    total += row[level - 1] ?? 0;
+  }
+  return total;
+}
+
 function formatSpellSlots(char: DdbCharacter): string {
-  if (!char.spellSlots || char.spellSlots.length === 0) {
-    return StringUtils.EMPTY;
+  // Max slots come from each class's spell table; DDB's per-character `spellSlots[].available`
+  // is frequently 0 and cannot be used as the total.
+  const maxByLevel = new Map<number, number>();
+
+  for (const cls of char.classes ?? []) {
+    const table = cls.definition?.spellRules?.levelSpellSlots;
+    if (!Array.isArray(table) || table.length === 0) continue;
+    const row = table[Math.min(cls.level, table.length - 1)];
+    if (!Array.isArray(row)) continue;
+    row.forEach((count, idx) => {
+      if (!count) return;
+      const level = idx + 1;
+      maxByLevel.set(level, (maxByLevel.get(level) ?? 0) + count);
+    });
   }
 
-  const lines = char.spellSlots
-    .filter(slot => slot.available > 0)
-    .map(slot => {
-      const filled = "\u25CF".repeat(slot.available - slot.used);
-      const empty = "\u25CB".repeat(slot.used);
-      return `Level ${slot.level}: ${filled}${empty} (${slot.used}/${slot.available} used)`;
-    });
+  if (maxByLevel.size === 0) return StringUtils.EMPTY;
 
-  if (lines.length === 0) return StringUtils.EMPTY;
+  const usedByLevel = new Map<number, number>();
+  for (const slot of char.spellSlots ?? []) {
+    usedByLevel.set(slot.level, slot.used ?? 0);
+  }
+
+  const lines = [...maxByLevel.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([level, total]) => {
+      const used = Math.min(usedByLevel.get(level) ?? 0, total);
+      const remaining = Math.max(0, total - used);
+      const filled = "\u25CF".repeat(remaining);
+      const empty = "\u25CB".repeat(used);
+      return `Level ${level}: ${filled}${empty} (${used}/${total} used)`;
+    });
 
   let result = `\n--- Spell Slots ---\n${lines.join("\n")}`;
 
-  // Add pact magic if available
-  if (char.pactMagic && char.pactMagic.available > 0) {
-    const filled = "\u25CF".repeat(char.pactMagic.available - char.pactMagic.used);
-    const empty = "\u25CB".repeat(char.pactMagic.used);
-    result += `\nPact Magic (Level ${char.pactMagic.level}): ${filled}${empty} (${char.pactMagic.used}/${char.pactMagic.available} used)`;
+  // Pact magic (warlocks): DDB returns one entry per slot level.
+  const pact = (char.pactMagic ?? []).find((p) => (p.available ?? 0) > 0);
+  if (pact) {
+    const remaining = pact.available - pact.used;
+    const filled = "\u25CF".repeat(Math.max(0, remaining));
+    const empty = "\u25CB".repeat(pact.used);
+    result += `\nPact Magic (Level ${pact.level}): ${filled}${empty} (${pact.used}/${pact.available} used)`;
   }
 
   return result;
@@ -534,6 +667,7 @@ function formatCharacterSheet(char: DdbCharacter): string {
     `Class: ${formatClasses(char)}`,
     `Level: ${computeLevel(char)} (Proficiency Bonus: +${calculateProficiencyBonus(computeLevel(char))})`,
     `Background: ${char.background?.definition?.name ?? "None"}`,
+    `Alignment: ${formatAlignment(char)}`,
     `HP: ${formatHp(char)}`,
     `AC: ${calculateAc(char)}`,
     formatSpeed(char),
@@ -552,13 +686,19 @@ function formatCharacterSheet(char: DdbCharacter): string {
   const proficiencies = formatProficiencies(char);
   if (proficiencies) sections.push(proficiencies.trim());
 
+  // Languages (builder choices + granted languages)
+  const languages = formatLanguages(char);
+  if (languages) sections.push(languages.trim());
+
   const spellcasting = formatSpellcasting(char);
   if (spellcasting) {
     sections.push(StringUtils.EMPTY, `--- Spellcasting ---`, spellcasting);
     const spells = formatSpells(char);
     if (spells) sections.push(spells.trim());
+  }
 
-    // Add spell slots display
+  // Spell slots are independent of whether any spells are listed.
+  {
     const spellSlots = formatSpellSlots(char);
     if (spellSlots) sections.push(spellSlots.trim());
   }
@@ -894,6 +1034,8 @@ function formatCharacter(char: DdbCharacter): string {
     `Race: ${char.race.fullName}`,
     `Class: ${formatClasses(char)}`,
     `Level: ${computeLevel(char)}`,
+    `Background: ${char.background?.definition?.name ?? "None"}`,
+    `Alignment: ${formatAlignment(char)}`,
     `HP: ${formatHp(char)}`,
     `AC: ${calculateAc(char)}`,
     `\nAbility Scores:\n${formatAbilityScores(char)}`,
@@ -1621,14 +1763,14 @@ export async function castSpell(
 
     // Determine if warlock using pact magic
     const isWarlock = character.classes.some(cls => cls.definition.name === "Warlock");
-    const hasPactMagic = character.pactMagic && character.pactMagic.available > 0;
+    const pactSlot = (character.pactMagic ?? []).find((p) => (p.available ?? 0) > 0) ?? null;
 
-    if (isWarlock && hasPactMagic && spellLevel <= character.pactMagic!.level) {
+    if (isWarlock && pactSlot && spellLevel <= pactSlot.level) {
       // Use pact magic slot
-      const newUsed = character.pactMagic!.used + 1;
-      if (newUsed > character.pactMagic!.available) {
+      const newUsed = pactSlot.used + 1;
+      if (newUsed > pactSlot.available) {
         return {
-          content: [{ type: "text", text: `No pact magic slots remaining (${character.pactMagic!.used}/${character.pactMagic!.available} used).` }],
+          content: [{ type: "text", text: `No pact magic slots remaining (${pactSlot.used}/${pactSlot.available} used).` }],
         };
       }
       await client.put(
@@ -1639,18 +1781,20 @@ export async function castSpell(
       return {
         content: [{
           type: "text",
-          text: `Cast ${spell.definition.name} using pact magic (level ${character.pactMagic!.level}). Pact slots: ${newUsed}/${character.pactMagic!.available} used.`,
+          text: `Cast ${spell.definition.name} using pact magic (level ${pactSlot.level}). Pact slots: ${newUsed}/${pactSlot.available} used.`,
         }],
       };
     }
 
     // Use regular spell slot
+    const maxSlots = maxSpellSlotsForLevel(character, spellLevel);
     const slotData = character.spellSlots?.find(s => s.level === spellLevel);
-    if (slotData) {
-      const newUsed = slotData.used + 1;
-      if (newUsed > slotData.available) {
+    if (maxSlots > 0) {
+      const usedNow = slotData?.used ?? 0;
+      const newUsed = usedNow + 1;
+      if (newUsed > maxSlots) {
         return {
-          content: [{ type: "text", text: `No level ${spellLevel} spell slots remaining (${slotData.used}/${slotData.available} used).` }],
+          content: [{ type: "text", text: `No level ${spellLevel} spell slots remaining (${usedNow}/${maxSlots} used).` }],
         };
       }
       await client.put(
@@ -1661,7 +1805,7 @@ export async function castSpell(
       return {
         content: [{
           type: "text",
-          text: `Cast ${spell.definition.name} at level ${spellLevel}. Level ${spellLevel} slots: ${newUsed}/${slotData.available} used.`,
+          text: `Cast ${spell.definition.name} at level ${spellLevel}. Level ${spellLevel} slots: ${newUsed}/${maxSlots} used.`,
         }],
       };
     }

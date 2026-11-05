@@ -31,17 +31,43 @@ export interface DdbCharacter {
   feats: DdbFeat[];
   notes: DdbNotes;
   level?: number;
-  pactMagic?: {
+  /** DDB returns one entry per pact slot level; entries with 0 available are unused. */
+  pactMagic?: Array<{
     level: number;
     used: number;
     available: number;
-  } | null;
+  }> | null;
   spellSlots?: Array<{
     level: number;
     used: number;
     available: number;
   }>;
   hitDiceUsed?: number;
+  /** Builder selections (ability score increases, languages, skill picks, …). */
+  choices?: DdbChoices | null;
+}
+
+export interface DdbChoiceOption {
+  id: number;
+  label: string;
+}
+
+export interface DdbChoice {
+  componentId: number;
+  label: string | null;
+  optionValue: number | null;
+  type: number;
+  subType: number | null;
+  optionIds?: number[];
+}
+
+export interface DdbChoices {
+  race?: DdbChoice[] | null;
+  class?: DdbChoice[] | null;
+  background?: DdbChoice[] | null;
+  feat?: DdbChoice[] | null;
+  item?: DdbChoice[] | null;
+  choiceDefinitions?: Array<{ options?: DdbChoiceOption[] | null }> | null;
 }
 
 export interface DdbRace {
@@ -53,7 +79,15 @@ export interface DdbRace {
 
 export interface DdbClass {
   id: number;
-  definition: { id: number; name: string };
+  definition: {
+    id: number;
+    name: string;
+    /** Spell table for this class. `levelSpellSlots[classLevel]` is the slot array (index 0 = 1st level). */
+    spellRules?: {
+      levelSpellSlots?: number[][] | null;
+      levelCantripsKnownMaxes?: number[] | null;
+    } | null;
+  };
   subclassDefinition: { name: string; classFeatures: DdbClassFeature[] } | null;
   level: number;
   isStartingClass: boolean;
@@ -168,8 +202,15 @@ export interface DdbTraits {
 export interface DdbLimitedUse {
   maxUses: number;
   numberUsed: number;
-  resetType: number; // 1 = Long Rest, 2 = Short Rest
+  /** 1 = short rest, 2 = long rest (per DDB's action payload). */
+  resetType: number;
   resetTypeDescription: string;
+  /** When set, max uses equals this ability's modifier (1=STR … 6=CHA). */
+  statModifierUsesId?: number | null;
+  /** When true, max uses equals the proficiency bonus. */
+  useProficiencyBonus?: boolean;
+  operator?: number;
+  resetDice?: unknown;
 }
 
 export interface DdbAction {
